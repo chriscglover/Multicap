@@ -9,7 +9,7 @@ Designed to capture high-bitrate multicast streams (>1.5 Gbps) without dropping 
 - **High Performance**: Separate threads for capture and writing with lock-free ring buffer
 - **PCAP Output**: Write standard PCAP files compatible with Wireshark, tcpdump, etc.
 - **Raw Output**: Strip IP/UDP/RTP headers and write raw payload (e.g., MPEG-TS streams)
-- **Adaptive Buffer**: Automatically sizes buffer based on available memory (up to 25%)
+- **Adaptive Buffer**: Automatically uses up to 25% of free RAM for the ring buffer
 - **Real-time Statistics**: Live display of packets captured, written, dropped, and buffer health
 - **Duration Control**: Capture for a specified number of seconds
 - **Stdout Support**: Pipe PCAP output directly to analysis tools
@@ -44,7 +44,7 @@ Output options (one required):
 
 Optional:
   --duration, -d SECS  Capture duration in seconds (0 = unlimited)
-  --buffer, -b MB      Ring buffer size in MB (default: 512, min: 64)
+  --buffer, -b MB      Ring buffer size in MB (default: auto, up to 25% of free RAM)
   --quiet, -q          Suppress statistics output
   --help, -h           Show help message
 ```
@@ -59,8 +59,8 @@ multicap --multi 239.1.1.1 -i eth0 --port 5000 --pcap capture.pcap
 # Capture for 60 seconds
 multicap --multi 239.1.1.1 -i eth0 --port 5000 --pcap capture.pcap -d 60
 
-# With larger buffer (1GB)
-multicap --multi 239.1.1.1 -i eth0 --port 5000 --pcap capture.pcap -b 1024
+# Override auto buffer size (e.g., limit to 256 MB)
+multicap --multi 239.1.1.1 -i eth0 --port 5000 --pcap capture.pcap -b 256
 ```
 
 ### Capture raw MPEG-TS stream
