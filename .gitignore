@@ -1,0 +1,23 @@
+# Compiled binary
+multicap
+
+# Object files
+*.o
+
+# Debug builds
+*.dSYM/
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Test captures
+*.pcap
+*.ts
+
+# OS files
+.DS_Store
+Thumbs.db
