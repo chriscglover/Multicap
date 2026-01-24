@@ -10,6 +10,7 @@ DEBUG_CFLAGS = -Wall -Wextra -g -O0 -pthread -DDEBUG
 TARGET = multicap
 SRC = multicap.c
 OBJ = $(SRC:.c=.o)
+MANPAGE = multicap.1
 
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
@@ -32,7 +33,10 @@ static: $(SRC)
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/
+	install -d $(DESTDIR)$(MANDIR)
+	install -m 644 $(MANPAGE) $(DESTDIR)$(MANDIR)/
 	@echo "Installed to $(DESTDIR)$(BINDIR)/$(TARGET)"
+	@echo "Man page installed to $(DESTDIR)$(MANDIR)/$(MANPAGE)"
 	@echo ""
 	@echo "Note: For optimal performance, consider:"
 	@echo "  1. Running as root for SO_BINDTODEVICE and real-time scheduling"
@@ -40,6 +44,7 @@ install: $(TARGET)
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
+	rm -f $(DESTDIR)$(MANDIR)/$(MANPAGE)
 
 clean:
 	rm -f $(TARGET) $(OBJ)
