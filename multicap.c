@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <sys/sysinfo.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
@@ -51,6 +52,7 @@
 #define MIN_BUFFER_MB       64
 #define MAX_PACKET_SIZE     65536
 #define STATS_INTERVAL_MS   500
+#define WRITE_BATCH_SIZE    256     /* Number of packets to batch for writing */
 
 /* Ring buffer packet entry */
 typedef struct {
@@ -88,6 +90,7 @@ typedef struct {
     /* Runtime state */
     int socket_fd;
     FILE *output_fp;
+    int output_fd;              /* File descriptor for direct I/O */
     ring_buffer_t *ring;
     volatile bool running;
     volatile bool writer_done;
@@ -225,36 +228,22 @@ static bool ring_buffer_push(ring_buffer_t *ring, const uint8_t *data,
     return true;
 }
 
-/* Pop packet from ring buffer (blocking with timeout) */
-static packet_entry_t *ring_buffer_pop(ring_buffer_t *ring, int timeout_ms) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += timeout_ms * 1000000;
-    if (ts.tv_nsec >= 1000000000) {
-        ts.tv_sec += ts.tv_nsec / 1000000000;
-        ts.tv_nsec %= 1000000000;
-    }
+/* Pop multiple packets from ring buffer (non-blocking, returns count) */
+static size_t ring_buffer_pop_batch(ring_buffer_t *ring, packet_entry_t **batch, 
+                                    size_t max_count) {
+    size_t count = 0;
     
     pthread_mutex_lock(&ring->mutex);
     
-    while (ring->head == ring->tail && g_state.running) {
-        if (pthread_cond_timedwait(&ring->not_empty, &ring->mutex, &ts) == ETIMEDOUT) {
-            pthread_mutex_unlock(&ring->mutex);
-            return NULL;
-        }
+    while (count < max_count && ring->head != ring->tail) {
+        batch[count] = &ring->packets[ring->tail];
+        ring->tail = (ring->tail + 1) % ring->capacity;
+        count++;
     }
-    
-    if (ring->head == ring->tail) {
-        pthread_mutex_unlock(&ring->mutex);
-        return NULL;
-    }
-    
-    packet_entry_t *entry = &ring->packets[ring->tail];
-    ring->tail = (ring->tail + 1) % ring->capacity;
     
     pthread_mutex_unlock(&ring->mutex);
     
-    return entry;
+    return count;
 }
 
 /* Create and configure multicast socket */
@@ -318,32 +307,26 @@ static int create_multicast_socket(const char *mcast_addr, const char *iface,
         fprintf(stderr, "Warning: Could not bind to interface (need root?)\n");
     }
     
+    /* Set receive timeout so we can check for shutdown */
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };  /* 100ms */
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
     return sock;
 }
 
-/* Write PCAP file header */
-static bool write_pcap_header(FILE *fp) {
-    pcap_file_header_t hdr = {
-        .magic_number = PCAP_MAGIC,
-        .version_major = PCAP_VERSION_MAJOR,
-        .version_minor = PCAP_VERSION_MINOR,
-        .thiszone = 0,
-        .sigfigs = 0,
-        .snaplen = MAX_PACKET_SIZE,
-        .network = PCAP_LINKTYPE_RAW
-    };
-    
-    return fwrite(&hdr, sizeof(hdr), 1, fp) == 1;
-}
-
-/* Write packet to PCAP file */
-static bool write_pcap_packet(FILE *fp, packet_entry_t *pkt) {
-    /* Build IP + UDP header for PCAP */
+/* Structure to hold prepared PCAP packet data */
+typedef struct {
+    pcap_packet_header_t phdr;
     uint8_t packet[MAX_PACKET_SIZE + 28];
+    size_t packet_len;
+} prepared_pcap_packet_t;
+
+/* Prepare a packet for PCAP output (builds headers, returns total size) */
+static size_t prepare_pcap_packet(packet_entry_t *pkt, prepared_pcap_packet_t *prepared) {
     size_t total_len = pkt->caplen + 28;  /* IP (20) + UDP (8) */
     
     /* IP header */
-    struct iphdr *ip = (struct iphdr *)packet;
+    struct iphdr *ip = (struct iphdr *)prepared->packet;
     ip->version = 4;
     ip->ihl = 5;
     ip->tos = 0;
@@ -357,36 +340,72 @@ static bool write_pcap_packet(FILE *fp, packet_entry_t *pkt) {
     ip->daddr = inet_addr(g_state.multicast_addr);
     
     /* UDP header */
-    struct udphdr *udp = (struct udphdr *)(packet + 20);
-    udp->source = pkt->src_addr.sin_port;  /* Already in network byte order */
+    struct udphdr *udp = (struct udphdr *)(prepared->packet + 20);
+    udp->source = pkt->src_addr.sin_port;
     udp->dest = htons(g_state.port);
     udp->len = htons(pkt->caplen + 8);
     udp->check = 0;
     
     /* Payload */
-    memcpy(packet + 28, pkt->data, pkt->caplen);
+    memcpy(prepared->packet + 28, pkt->data, pkt->caplen);
     
     /* PCAP packet header */
-    pcap_packet_header_t phdr = {
-        .ts_sec = pkt->ts.tv_sec,
-        .ts_usec = pkt->ts.tv_usec,
-        .incl_len = total_len,
-        .orig_len = pkt->len + 28
-    };
+    prepared->phdr.ts_sec = pkt->ts.tv_sec;
+    prepared->phdr.ts_usec = pkt->ts.tv_usec;
+    prepared->phdr.incl_len = total_len;
+    prepared->phdr.orig_len = pkt->len + 28;
     
-    if (fwrite(&phdr, sizeof(phdr), 1, fp) != 1) return false;
-    if (fwrite(packet, total_len, 1, fp) != 1) return false;
+    prepared->packet_len = total_len;
     
-    return true;
+    return sizeof(pcap_packet_header_t) + total_len;
 }
 
-/* Write raw payload (strips RTP headers automatically) */
-static bool write_raw_packet(FILE *fp, packet_entry_t *pkt) {
+/* Write batch of PCAP packets using writev for efficiency */
+static size_t write_pcap_batch(int fd, packet_entry_t **batch, size_t count,
+                                prepared_pcap_packet_t *prepared_packets) {
+    struct iovec iov[WRITE_BATCH_SIZE * 2];  /* 2 iovecs per packet (header + data) */
+    size_t total_bytes = 0;
+    size_t iov_count = 0;
+    
+    /* Build iovec array - each packet needs header + data */
+    for (size_t i = 0; i < count && iov_count < WRITE_BATCH_SIZE * 2; i++) {
+        prepare_pcap_packet(batch[i], &prepared_packets[i]);
+        
+        /* PCAP packet header */
+        iov[iov_count].iov_base = &prepared_packets[i].phdr;
+        iov[iov_count].iov_len = sizeof(pcap_packet_header_t);
+        total_bytes += sizeof(pcap_packet_header_t);
+        iov_count++;
+        
+        /* Packet data */
+        iov[iov_count].iov_base = prepared_packets[i].packet;
+        iov[iov_count].iov_len = prepared_packets[i].packet_len;
+        total_bytes += prepared_packets[i].packet_len;
+        iov_count++;
+    }
+    
+    if (iov_count == 0) {
+        return count;
+    }
+    
+    /* Single system call for all packets */
+    ssize_t written = writev(fd, iov, iov_count);
+    
+    if (written < 0) {
+        return 0;
+    }
+    
+    return (size_t)written == total_bytes ? count : 0;
+}
+
+/* Extract raw payload from packet (strips RTP headers automatically) 
+ * Returns pointer to payload and sets payload_len */
+static uint8_t *extract_raw_payload(packet_entry_t *pkt, size_t *payload_len) {
     uint8_t *payload = pkt->data;
-    size_t payload_len = pkt->caplen;
+    *payload_len = pkt->caplen;
     
     /* Check for and strip RTP header */
-    if (payload_len > RTP_HEADER_SIZE) {
+    if (*payload_len > RTP_HEADER_SIZE) {
         /* Check RTP version (bits 6-7 of first byte should be 2) */
         uint8_t rtp_version = (payload[0] >> 6) & 0x03;
         
@@ -399,7 +418,7 @@ static bool write_raw_packet(FILE *fp, packet_entry_t *pkt) {
             
             /* Check for extension header (bit 4 of first byte) */
             if (payload[0] & 0x10) {
-                if (payload_len > rtp_header_len + 4) {
+                if (*payload_len > rtp_header_len + 4) {
                     /* Extension length is in 32-bit words, at offset 2-3 of extension */
                     uint16_t ext_len = (payload[rtp_header_len + 2] << 8) | 
                                        payload[rtp_header_len + 3];
@@ -409,29 +428,29 @@ static bool write_raw_packet(FILE *fp, packet_entry_t *pkt) {
             
             /* Check for padding (bit 5 of first byte) */
             if (payload[0] & 0x20) {
-                if (payload_len > 0) {
+                if (*payload_len > 0) {
                     /* Last byte contains padding length */
-                    uint8_t padding_len = payload[payload_len - 1];
-                    if (padding_len < payload_len) {
-                        payload_len -= padding_len;
+                    uint8_t padding_len = payload[*payload_len - 1];
+                    if (padding_len < *payload_len) {
+                        *payload_len -= padding_len;
                     }
                 }
             }
             
-            if (rtp_header_len < payload_len) {
+            if (rtp_header_len < *payload_len) {
                 payload += rtp_header_len;
-                payload_len -= rtp_header_len;
+                *payload_len -= rtp_header_len;
                 
                 /* Verify we have valid MPEG-TS data (sync byte 0x47) */
-                if (payload_len >= 188 && payload[0] != 0x47) {
+                if (*payload_len >= 188 && payload[0] != 0x47) {
                     /* Try to find sync byte - some implementations add extra bytes */
-                    for (size_t i = 0; i < payload_len - 188 && i < 16; i++) {
+                    for (size_t i = 0; i < *payload_len - 188 && i < 16; i++) {
                         if (payload[i] == 0x47 && 
-                            (payload_len - i) >= 188 &&
-                            ((payload_len - i) % 188 == 0 || 
-                             (payload_len - i >= 376 && payload[i + 188] == 0x47))) {
+                            (*payload_len - i) >= 188 &&
+                            ((*payload_len - i) % 188 == 0 || 
+                             (*payload_len - i >= 376 && payload[i + 188] == 0x47))) {
                             payload += i;
-                            payload_len -= i;
+                            *payload_len -= i;
                             break;
                         }
                     }
@@ -440,12 +459,39 @@ static bool write_raw_packet(FILE *fp, packet_entry_t *pkt) {
         }
     }
     
-    if (payload_len == 0) {
-        return true;  /* Nothing to write is not an error */
+    return payload;
+}
+
+/* Write batch of raw packets using writev for efficiency */
+static size_t write_raw_batch(int fd, packet_entry_t **batch, size_t count) {
+    struct iovec iov[WRITE_BATCH_SIZE];
+    size_t payload_lens[WRITE_BATCH_SIZE];
+    size_t total_bytes = 0;
+    size_t iov_count = 0;
+    
+    /* Build iovec array */
+    for (size_t i = 0; i < count && iov_count < WRITE_BATCH_SIZE; i++) {
+        uint8_t *payload = extract_raw_payload(batch[i], &payload_lens[i]);
+        if (payload_lens[i] > 0) {
+            iov[iov_count].iov_base = payload;
+            iov[iov_count].iov_len = payload_lens[i];
+            total_bytes += payload_lens[i];
+            iov_count++;
+        }
     }
     
-    size_t written = fwrite(payload, 1, payload_len, fp);
-    return written == payload_len;
+    if (iov_count == 0) {
+        return count;  /* All empty, but not an error */
+    }
+    
+    /* Single system call for all packets */
+    ssize_t written = writev(fd, iov, iov_count);
+    
+    if (written < 0) {
+        return 0;
+    }
+    
+    return (size_t)written == total_bytes ? count : 0;
 }
 
 /* Capture thread - receives packets from network */
@@ -502,21 +548,53 @@ static void *capture_thread_func(void *arg) {
 static void *writer_thread_func(void *arg) {
     (void)arg;
     
+    packet_entry_t *batch[WRITE_BATCH_SIZE];
+    prepared_pcap_packet_t *prepared_packets = NULL;
+    
+    /* Allocate prepared packet buffer for PCAP mode */
+    if (g_state.pcap_mode) {
+        prepared_packets = malloc(WRITE_BATCH_SIZE * sizeof(prepared_pcap_packet_t));
+        if (!prepared_packets) {
+            fprintf(stderr, "Error: Failed to allocate PCAP buffer\n");
+            g_state.writer_done = true;
+            return NULL;
+        }
+    }
+    
     while (g_state.running || g_state.ring->head != g_state.ring->tail) {
-        packet_entry_t *pkt = ring_buffer_pop(g_state.ring, 100);
-        if (!pkt) continue;
+        /* Batch pop for both modes */
+        size_t count = ring_buffer_pop_batch(g_state.ring, batch, WRITE_BATCH_SIZE);
         
-        bool success;
+        if (count == 0) {
+            /* Buffer empty, wait a bit */
+            usleep(1000);  /* 1ms */
+            continue;
+        }
+        
+        /* Calculate total bytes for stats */
+        size_t total_bytes = 0;
+        for (size_t i = 0; i < count; i++) {
+            total_bytes += batch[i]->caplen;
+        }
+        
+        size_t written;
         if (g_state.pcap_mode) {
-            success = write_pcap_packet(g_state.output_fp, pkt);
+            /* PCAP mode: batch write with headers */
+            written = write_pcap_batch(g_state.output_fd, batch, count, prepared_packets);
         } else {
-            success = write_raw_packet(g_state.output_fp, pkt);
+            /* Raw mode: batch write payloads only */
+            written = write_raw_batch(g_state.output_fd, batch, count);
         }
         
-        if (success) {
-            __sync_fetch_and_add(&g_state.packets_written, 1);
-            __sync_fetch_and_add(&g_state.bytes_written, pkt->caplen);
+        if (written > 0) {
+            __sync_fetch_and_add(&g_state.packets_written, count);
+            __sync_fetch_and_add(&g_state.bytes_written, total_bytes);
         }
+    }
+    
+    /* Cleanup */
+    if (prepared_packets) {
+        free(prepared_packets);
     }
     
     g_state.writer_done = true;
@@ -529,7 +607,6 @@ static void *stats_thread_func(void *arg) {
     
     if (g_state.quiet) return NULL;
     
-    uint64_t last_packets = 0;
     uint64_t last_bytes = 0;
     struct timeval last_time, now;
     gettimeofday(&last_time, NULL);
@@ -541,22 +618,45 @@ static void *stats_thread_func(void *arg) {
         double elapsed = (now.tv_sec - last_time.tv_sec) + 
                         (now.tv_usec - last_time.tv_usec) / 1000000.0;
         
-        uint64_t cur_packets = g_state.packets_captured;
         uint64_t cur_bytes = g_state.bytes_captured;
         
-        double pps = (cur_packets - last_packets) / elapsed;
         double mbps = ((cur_bytes - last_bytes) * 8.0) / (elapsed * 1000000.0);
         double fill = ring_buffer_fill_level(g_state.ring) * 100.0;
         
+        /* Determine warning level based on buffer fill */
+        const char *warning = "";
+        const char *color_start = "";
+        const char *color_end = "";
+        
+        if (fill > 90.0 || g_state.packets_dropped > 0) {
+            /* Critical - disk can't keep up */
+            color_start = "\033[1;31m";  /* Bold red */
+            color_end = "\033[0m";
+            warning = " ** DISK TOO SLOW - DROPPING PACKETS **";
+        } else if (fill > 75.0) {
+            /* Warning - buffer filling up */
+            color_start = "\033[1;33m";  /* Bold yellow */
+            color_end = "\033[0m";
+            warning = " * WARNING: Buffer filling - disk may be too slow *";
+        } else if (fill > 50.0) {
+            /* Caution */
+            color_start = "\033[33m";  /* Yellow */
+            color_end = "\033[0m";
+            warning = " (buffer elevated)";
+        }
+        
         fprintf(stderr, "\r\033[K"
-                "Captured: %lu pkts | Written: %lu pkts | Dropped: %lu pkts | "
-                "Rate: %.1f Mbps (%.0f pps) | Buffer: %.1f%%",
+                "Captured: %lu | Written: %lu | %sDropped: %lu%s | "
+                "Rate: %.1f Mbps | Buffer: %s%.1f%%%s%s",
                 g_state.packets_captured,
                 g_state.packets_written,
+                g_state.packets_dropped > 0 ? "\033[1;31m" : "",
                 g_state.packets_dropped,
-                mbps, pps, fill);
+                g_state.packets_dropped > 0 ? "\033[0m" : "",
+                mbps, 
+                color_start, fill, color_end,
+                warning);
         
-        last_packets = cur_packets;
         last_bytes = cur_bytes;
         last_time = now;
     }
@@ -739,24 +839,35 @@ int main(int argc, char **argv) {
     /* Open output file */
     if (strcmp(g_state.output_file, "-") == 0) {
         g_state.output_fp = stdout;
+        g_state.output_fd = STDOUT_FILENO;
         g_state.quiet = true;  /* Don't mix stats with output */
     } else {
-        g_state.output_fp = fopen(g_state.output_file, "wb");
-        if (!g_state.output_fp) {
-            perror("fopen");
+        /* Both modes now use direct fd for writev batching */
+        g_state.output_fd = open(g_state.output_file, 
+                                  O_WRONLY | O_CREAT | O_TRUNC, 
+                                  0644);
+        if (g_state.output_fd < 0) {
+            perror("open");
             ring_buffer_destroy(g_state.ring);
             return 1;
         }
+        g_state.output_fp = NULL;
     }
-    
-    /* Set output buffer for better write performance */
-    setvbuf(g_state.output_fp, NULL, _IOFBF, 1024 * 1024);
     
     /* Write PCAP header if in PCAP mode */
     if (g_state.pcap_mode) {
-        if (!write_pcap_header(g_state.output_fp)) {
+        pcap_file_header_t hdr = {
+            .magic_number = PCAP_MAGIC,
+            .version_major = PCAP_VERSION_MAJOR,
+            .version_minor = PCAP_VERSION_MINOR,
+            .thiszone = 0,
+            .sigfigs = 0,
+            .snaplen = MAX_PACKET_SIZE,
+            .network = PCAP_LINKTYPE_RAW
+        };
+        if (write(g_state.output_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
             fprintf(stderr, "Error: Failed to write PCAP header\n");
-            fclose(g_state.output_fp);
+            close(g_state.output_fd);
             ring_buffer_destroy(g_state.ring);
             return 1;
         }
@@ -767,7 +878,9 @@ int main(int argc, char **argv) {
                                                  g_state.interface, 
                                                  g_state.port);
     if (g_state.socket_fd < 0) {
-        fclose(g_state.output_fp);
+        if (g_state.output_fd > 0 && g_state.output_fd != STDOUT_FILENO) {
+            close(g_state.output_fd);
+        }
         ring_buffer_destroy(g_state.ring);
         return 1;
     }
@@ -817,8 +930,10 @@ int main(int argc, char **argv) {
     
     /* Cleanup */
     close(g_state.socket_fd);
-    if (g_state.output_fp != stdout) {
+    if (g_state.output_fp && g_state.output_fp != stdout) {
         fclose(g_state.output_fp);
+    } else if (g_state.output_fd > 0 && g_state.output_fd != STDOUT_FILENO) {
+        close(g_state.output_fd);
     }
     ring_buffer_destroy(g_state.ring);
     
