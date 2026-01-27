@@ -1,184 +1,191 @@
-.\" Man page for multicap
-.\" Contact: N/A
-.\" License: MIT
-.TH MULTICAP 1 "January 2026" "multicap 1.0" "User Commands"
+.TH MULTICAP 1 "January 2026" "multicap 2.0" "User Commands"
 .SH NAME
 multicap \- high-performance multicast stream capture utility
 .SH SYNOPSIS
 .B multicap
-.B \-\-multi
-.I address
-.B \-i
-.I interface
-.B \-\-port
-.I port
-.RB { \-\-pcap | \-\-raw }
-.I file
-.RI [ options ]
+[\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B multicap
-captures multicast UDP streams and writes them to either PCAP files (for analysis with Wireshark, tcpdump, etc.) or raw payload files (e.g., MPEG-TS streams).
+captures multicast UDP streams and writes them to PCAP files or raw payload files.
+It is designed for high-bitrate streams (>1.5 Gbps) using a threaded architecture
+with large ring buffers to decouple network I/O from disk I/O.
 .PP
-Designed for high-bitrate streams (>1.5 Gbps), it uses a threaded architecture with a large ring buffer to decouple network I/O from disk I/O, minimizing packet loss.
-.SH OPTIONS
-.SS Required Options
+Version 2.0 adds support for SMPTE 2022-7 seamless protection switching,
+allowing simultaneous capture of both redundant network paths.
+.SH "SINGLE STREAM MODE"
 .TP
-.BR \-\-multi ", " \-m " " \fIaddress\fR
-Multicast group address to join (e.g., 239.1.1.1). Must be a valid multicast address in the range 224.0.0.0 to 239.255.255.255.
+\fB\-m\fR, \fB\-\-multi\fR=\fIADDR\fR
+Multicast group address to capture (e.g., 239.1.1.1).
+Must be in the range 224.0.0.0 \- 239.255.255.255.
 .TP
-.BR \-i " " \fIinterface\fR
+\fB\-i\fR \fIINTERFACE\fR
 Network interface to capture on (e.g., eth0, ens18).
 .TP
-.BR \-\-port ", " \-p " " \fIport\fR
-UDP port number to listen on.
-.SS Output Options (one required)
+\fB\-p\fR, \fB\-\-port\fR=\fIPORT\fR
+UDP port number.
 .TP
-.BR \-\-pcap " " \fIfile\fR
-Write packets to a PCAP file. The file will contain reconstructed IP/UDP headers suitable for analysis with packet capture tools. Use
-.B \-
-to write to standard output.
+\fB\-\-pcap\fR=\fIFILE\fR
+Write packets to PCAP file. Use '\-' for stdout.
 .TP
-.BR \-\-raw " " \fIfile\fR
-Write raw payload data to a file. RTP headers are automatically stripped if present, making this suitable for capturing MPEG-TS or other payload formats. Use
-.B \-
-to write to standard output.
-.SS Optional
+\fB\-\-raw\fR=\fIFILE\fR
+Write raw payload to file, stripping IP/UDP/RTP headers.
+Use '\-' for stdout. Useful for capturing MPEG-TS streams.
+.SH "SMPTE 2022-7 MODE"
 .TP
-.BR \-\-duration ", " \-d " " \fIseconds\fR
-Capture duration in seconds. Default is 0 (unlimited, until interrupted).
+\fB\-7\fR
+Enable SMPTE 2022-7 redundancy capture mode.
 .TP
-.BR \-\-buffer ", " \-b " " \fImegabytes\fR
-Ring buffer size in megabytes. By default, automatically sizes to 25% of free memory (minimum 64 MB). If specified, the requested size will be used but capped at 25% of free memory.
+\fB\-\-redmulti\fR=\fIADDR\fR
+Red path multicast address.
 .TP
-.BR \-\-quiet ", " \-q
-Suppress statistics output. Automatically enabled when writing to standard output.
+\fB\-\-redport\fR=\fIPORT\fR
+Red path UDP port.
 .TP
-.BR \-\-help ", " \-h
-Display help message and exit.
-.SH EXIT STATUS
+\fB\-\-redint\fR=\fIINTERFACE\fR
+Red path network interface.
 .TP
-.B 0
-Success, no packets dropped.
+\fB\-\-bluemulti\fR=\fIADDR\fR
+Blue path multicast address.
 .TP
-.B 1
-Error (invalid arguments, socket error, file error, etc.).
+\fB\-\-blueport\fR=\fIPORT\fR
+Blue path UDP port.
 .TP
-.B 2
-Success, but some packets were dropped due to buffer overflow.
+\fB\-\-blueint\fR=\fIINTERFACE\fR
+Blue path network interface.
+.TP
+\fB\-\-redpcap\fR=\fIFILE\fR
+Write red path packets to PCAP file.
+.TP
+\fB\-\-bluepcap\fR=\fIFILE\fR
+Write blue path packets to PCAP file.
+.SH "COMMON OPTIONS"
+.TP
+\fB\-d\fR, \fB\-\-duration\fR=\fISECS\fR
+Capture duration in seconds. Default is 0 (unlimited).
+.TP
+\fB\-b\fR, \fB\-\-buffer\fR=\fIMB\fR
+Ring buffer size in megabytes. Default automatically uses up to 25% of free RAM.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Suppress statistics output.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Show version information and exit.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Show help message and exit.
 .SH EXAMPLES
-Capture a multicast stream to a PCAP file:
+.SS "Single Stream Capture"
 .PP
+Capture multicast stream to PCAP file:
 .RS
 .nf
 multicap \-\-multi 239.1.1.1 \-i eth0 \-\-port 5000 \-\-pcap capture.pcap
 .fi
 .RE
 .PP
-Capture for 60 seconds:
-.PP
+Capture raw MPEG-TS stream for 60 seconds:
 .RS
 .nf
-multicap \-\-multi 239.1.1.1 \-i eth0 \-\-port 5000 \-\-pcap capture.pcap \-d 60
-.fi
-.RE
-.PP
-Capture raw MPEG-TS stream:
-.PP
-.RS
-.nf
-multicap \-\-multi 239.1.1.1 \-i eth0 \-\-port 5000 \-\-raw stream.ts
+multicap \-\-multi 239.1.1.1 \-i eth0 \-\-port 5000 \-\-raw stream.ts \-d 60
 .fi
 .RE
 .PP
 Pipe to tcpdump for live analysis:
-.PP
 .RS
 .nf
 multicap \-\-multi 239.1.1.1 \-i eth0 \-\-port 5000 \-\-pcap \- | tcpdump \-r \- \-nn
 .fi
 .RE
+.SS "SMPTE 2022-7 Capture"
 .PP
-Pipe raw stream to ffprobe:
-.PP
+Capture both redundant paths:
 .RS
 .nf
-multicap \-\-multi 239.1.1.1 \-i eth0 \-\-port 5000 \-\-raw \- | ffprobe \-i \-
+multicap \-7 \\
+  \-\-redmulti 239.20.1.35 \-\-redport 40000 \-\-redint eth20 \-\-redpcap red.pcap \\
+  \-\-bluemulti 239.21.1.35 \-\-blueport 40000 \-\-blueint eth21 \-\-bluepcap blue.pcap
 .fi
 .RE
-.SH ARCHITECTURE
-.B multicap
-uses three threads:
-.TP
-.B Capture thread
-Receives packets from the network socket at high priority and pushes them to a lock-free ring buffer.
-.TP
-.B Writer thread
-Pops packets from the ring buffer and writes them to the output file with buffered I/O.
-.TP
-.B Statistics thread
-Displays live capture statistics to standard error.
 .PP
-The ring buffer is allocated using
-.BR mmap (2)
-and locked in memory with
-.BR mlock (2)
-to prevent swapping and ensure consistent performance.
-.SH PERFORMANCE TUNING
-For optimal performance with high-bitrate streams:
-.SS System Socket Buffers
+Capture for 30 seconds:
+.RS
+.nf
+multicap \-7 \-d 30 \\
+  \-\-redmulti 239.20.1.35 \-\-redport 40000 \-\-redint eth20 \-\-redpcap red.pcap \\
+  \-\-bluemulti 239.21.1.35 \-\-blueport 40000 \-\-blueint eth21 \-\-bluepcap blue.pcap
+.fi
+.RE
+.SH "STATISTICS DISPLAY"
+During capture, multicap displays live statistics on stderr.
+.SS "Single Stream Mode"
+.RS
+.nf
+Captured: 1234567 | Written: 1234500 | Dropped: 0 | Rate: 1523.4 Mbps | Buffer: 2.3%
+.fi
+.RE
+.SS "SMPTE 2022-7 Mode"
+.RS
+.nf
+Red: 617283 (1.2%) | Blue: 617284 (1.1%) | Dropped: 0 | 3046.8 Mbps
+.fi
+.RE
 .PP
+Buffer fill warnings are color-coded:
+.RS
+.IP \(bu 2
+>50%: Yellow "(buffer elevated)"
+.IP \(bu 2
+>75%: Bold yellow "WARNING: Buffer filling"
+.IP \(bu 2
+>90%: Bold red "DISK TOO SLOW - DROPPING PACKETS"
+.RE
+.SH "PERFORMANCE TUNING"
+.SS "System Socket Buffers"
 .RS
 .nf
 sudo sysctl \-w net.core.rmem_max=536870912
 sudo sysctl \-w net.core.rmem_default=67108864
 .fi
 .RE
-.SS Network Interface Ring Buffer
-.PP
+.SS "Network Interface"
 .RS
 .nf
 sudo ethtool \-G eth0 rx 4096
 .fi
 .RE
-.SS CPU Affinity
-.PP
-.RS
-.nf
-taskset \-c 2,3 multicap \-\-multi 239.1.1.1 \-i eth0 \-\-port 5000 \-\-pcap out.pcap
-.fi
-.RE
-.SS Capabilities (instead of running as root)
-.PP
+.SS "Capabilities (instead of root)"
 .RS
 .nf
 sudo setcap cap_net_raw,cap_net_admin,cap_sys_nice+ep /usr/local/bin/multicap
 .fi
 .RE
+.SH "EXIT STATUS"
+.TP
+.B 0
+Success, no packets dropped.
+.TP
+.B 1
+Error (invalid arguments, socket error, etc.).
+.TP
+.B 2
+Success, but some packets were dropped.
 .SH FILES
-Output files are created at the path specified by
-.B \-\-pcap
-or
-.BR \-\-raw .
+Output files are created in the current directory unless an absolute path is specified.
 .SH NOTES
-.IP \(bu 2
-Root privileges or appropriate capabilities are required to join multicast groups and bind to network interfaces.
-.IP \(bu 2
-The PCAP files use linktype RAW (101), containing IP headers without Ethernet framing.
-.IP \(bu 2
-In raw mode, RTP headers (RFC 3550) are automatically detected and stripped. Non-RTP payloads are written as-is.
-.IP \(bu 2
-Statistics are written to standard error and are automatically suppressed when output is directed to standard output.
-.SH SEE ALSO
-.BR tcpdump (1),
-.BR wireshark (1),
-.BR tshark (1),
-.BR ffprobe (1),
-.BR ip (8),
-.BR ethtool (8),
-.BR sysctl (8)
+For streams exceeding 1.5 Gbps, NVMe storage is recommended.
+For 3+ Gbps streams, consider using a RAM disk (/dev/shm or tmpfs) for captures.
+.PP
+SATA SSDs typically cannot sustain the write speeds required for 3 Gbps streams.
 .SH BUGS
 Report bugs to the project maintainer.
 .SH AUTHOR
-Generated by Claude, from an idea by Christopher Glover (c) 2026.
-.SH LICENSE
-MIT License
+Claude (Anthropic), from an idea by Christopher Glover.
+.SH COPYRIGHT
+Copyright \(co 2026 Christopher Glover. MIT License.
+.SH "SEE ALSO"
+.BR tcpdump (1),
+.BR wireshark (1),
+.BR tshark (1),
+.BR ethtool (8),
+.BR sysctl (8)
