@@ -1,4 +1,4 @@
-.TH MULTICAP 1 "January 2026" "multicap 2.0" "User Commands"
+.TH MULTICAP 1 "November 2026" "multicap 3.0" "User Commands"
 .SH NAME
 multicap \- high-performance multicast stream capture utility
 .SH SYNOPSIS
@@ -10,8 +10,19 @@ captures multicast UDP streams and writes them to PCAP files or raw payload file
 It is designed for high-bitrate streams (>1.5 Gbps) using a threaded architecture
 with large ring buffers to decouple network I/O from disk I/O.
 .PP
-Version 2.0 adds support for SMPTE 2022-7 seamless protection switching,
-allowing simultaneous capture of both redundant network paths.
+It supports SMPTE 2022-7 seamless protection switching, capturing both
+redundant network paths at once.
+.PP
+Frames are received with an AF_PACKET TPACKET_V3 memory-mapped ring, so PCAP
+files hold the real Ethernet frames from the wire (link type Ethernet), with
+every header exactly as received and nanosecond timestamps.
+A kernel BPF filter passes only UDP to the chosen group and port.
+A separate UDP socket holds the IGMP membership; it is never read.
+multicap uses only standard Linux interfaces and works with any Ethernet
+NIC and driver.
+.PP
+multicap needs CAP_NET_RAW (root, or file capabilities; see
+.BR "PERFORMANCE TUNING" ).
 .SH "SINGLE STREAM MODE"
 .TP
 \fB\-m\fR, \fB\-\-multi\fR=\fIADDR\fR
@@ -25,7 +36,8 @@ Network interface to capture on (e.g., eth0, ens18).
 UDP port number.
 .TP
 \fB\-\-pcap\fR=\fIFILE\fR
-Write packets to PCAP file. Use '\-' for stdout.
+Write Ethernet frames to a nanosecond PCAP file. Use '\-' for stdout.
+If the NIC strips 802.1Q tags, the tag is put back in each frame.
 .TP
 \fB\-\-raw\fR=\fIFILE\fR
 Write raw payload to file, stripping IP/UDP/RTP headers.
@@ -65,6 +77,25 @@ Capture duration in seconds. Default is 0 (unlimited).
 .TP
 \fB\-b\fR, \fB\-\-buffer\fR=\fIMB\fR
 Ring buffer size in megabytes. Default automatically uses up to 25% of free RAM.
+In 2022-7 mode the size is shared by the captured paths.
+.TP
+\fB\-\-kring\fR=\fIMB\fR
+Size of the kernel receive ring per path in megabytes (default 256).
+Frames wait here until the capture thread copies them to the ring buffer.
+.TP
+\fB\-\-split\-gro\fR
+Write each UDP datagram of a GRO aggregate as its own frame, with the
+lengths, IP ID and checksums recomputed per datagram as the kernel does when
+it splits such a packet. Without it, aggregates are written as received,
+the same as
+.BR tcpdump (1).
+Needs Linux 6.2 or later. \fB\-\-raw\fR always splits aggregates.
+.TP
+\fB\-\-hwts\fR
+Use NIC hardware receive timestamps. multicap enables timestamping of all
+packets on the NIC (needs CAP_NET_ADMIN) and restores the previous setting on
+exit. If the NIC or driver cannot do this, a warning is printed and software
+timestamps are used.
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 Suppress statistics output.
@@ -121,15 +152,22 @@ During capture, multicap displays live statistics on stderr.
 .SS "Single Stream Mode"
 .RS
 .nf
-Captured: 1234567 | Written: 1234500 | Dropped: 0 | Rate: 1523.4 Mbps | Buffer: 2.3%
+Captured: 1234567 | Written: 1234500 | Ring drops: 0 | Kernel drops: 0 | Rate: 1523.4 Mbps | Buffer: 2.3%
 .fi
 .RE
 .SS "SMPTE 2022-7 Mode"
 .RS
 .nf
-Red: 617283 (1.2%) | Blue: 617284 (1.1%) | Dropped: 0 | 3046.8 Mbps
+Red: 617283 (1.2%) | Blue: 617284 (1.1%) | Ring drops: 0 | Kernel drops: 0 | 3046.8 Mbps
 .fi
 .RE
+.PP
+Counts are frames. \fBRing drops\fR are frames lost because the ring buffer
+was full (output too slow). \fBKernel drops\fR are frames lost because the
+kernel receive ring was full (capture thread too slow); see \fB\-\-kring\fR.
+The final summary also shows, per path, the number of UDP datagrams, how many
+frames were GRO aggregates, bytes written, the drop rate and, with
+\fB\-\-hwts\fR, how many frames had a hardware timestamp.
 .PP
 Buffer fill warnings are color-coded:
 .RS
@@ -138,16 +176,14 @@ Buffer fill warnings are color-coded:
 .IP \(bu 2
 >75%: Bold yellow "WARNING: Buffer filling"
 .IP \(bu 2
->90%: Bold red "DISK TOO SLOW - DROPPING PACKETS"
+>90% or any ring drop: Bold red "DISK TOO SLOW - DROPPING PACKETS"
+.IP \(bu 2
+Any kernel drop: Bold red "KERNEL RING DROPS - capture CPU too slow"
 .RE
 .SH "PERFORMANCE TUNING"
-.SS "System Socket Buffers"
-.RS
-.nf
-sudo sysctl \-w net.core.rmem_max=536870912
-sudo sysctl \-w net.core.rmem_default=67108864
-.fi
-.RE
+.SS "Kernel Ring"
+Use \fB\-\-kring\fR. The net.core.rmem sysctls have no effect: frames do
+not pass through a socket buffer.
 .SS "Network Interface"
 .RS
 .nf
@@ -160,13 +196,17 @@ sudo ethtool \-G eth0 rx 4096
 sudo setcap cap_net_raw,cap_net_admin,cap_sys_nice+ep /usr/local/bin/multicap
 .fi
 .RE
+.PP
+CAP_NET_RAW is required. CAP_NET_ADMIN is used by \fB\-\-hwts\fR and
+CAP_SYS_NICE for the capture thread's real-time priority.
+File capabilities are ignored on filesystems mounted nosuid.
 .SH "EXIT STATUS"
 .TP
 .B 0
 Success, no packets dropped.
 .TP
 .B 1
-Error (invalid arguments, socket error, etc.).
+Error (invalid arguments, socket error, missing CAP_NET_RAW, write error).
 .TP
 .B 2
 Success, but some packets were dropped.
@@ -177,6 +217,10 @@ For streams exceeding 1.5 Gbps, NVMe storage is recommended.
 For 3+ Gbps streams, consider using a RAM disk (/dev/shm or tmpfs) for captures.
 .PP
 SATA SSDs typically cannot sustain the write speeds required for 3 Gbps streams.
+.PP
+Many NICs and drivers merge consecutive datagrams of a stream into one large
+frame (GRO). Such records show only the first RTP header in Wireshark; use
+\fB\-\-split\-gro\fR to get one record per datagram.
 .SH BUGS
 Report bugs to the project maintainer.
 .SH AUTHOR

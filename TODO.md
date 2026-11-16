@@ -42,6 +42,27 @@ For capturing streams beyond 3 Gbps, kernel bypass is essential to avoid packet 
 - 25 Gbps aggregated streams
 - 100 Gbps with DPDK
 
+## Possible follow-ups
+
+- `--raw` keeps v2.0's MPEG-TS sync-byte search, which can trim up to 16 bytes
+  from non-TS payloads (e.g. ST 2022-6) when the data happens to contain 0x47
+  patterns. Make it apply only to MPEG-TS payloads (RTP PT 33).
+- `--raw` for 2022-7 mode.
+- `PACKET_FANOUT` across several capture threads for >10 Gbps on one path.
+- Restore the NIC hardware timestamp setting on SIGKILL too (currently on
+  normal exit only).
+
+## Completed in v3.0
+
+- [x] AF_PACKET + TPACKET_V3 mmap receive; real Ethernet frames in pcap
+- [x] Kernel BPF filter (group + port), IGMP join on a separate socket
+- [x] Nanosecond pcap timestamps; optional hardware timestamps (`--hwts`)
+- [x] VLAN tag restore
+- [x] GRO aggregate handling (`--split-gro`, raw mode)
+- [x] Kernel ring drop statistics
+- [x] Variable-length ring records; writer/capture race fixed
+- [x] One code path for single, red and blue
+
 ## Completed in v2.0
 
 - [x] Basic multicast capture

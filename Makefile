@@ -38,9 +38,9 @@ install: $(TARGET)
 	@echo "Installed to $(DESTDIR)$(BINDIR)/$(TARGET)"
 	@echo "Man page installed to $(DESTDIR)$(MANDIR)/$(MANPAGE)"
 	@echo ""
-	@echo "Note: For optimal performance, consider:"
-	@echo "  1. Running as root for SO_BINDTODEVICE and real-time scheduling"
-	@echo "  2. Setting capabilities: sudo setcap cap_net_raw,cap_net_admin,cap_sys_nice+ep $(DESTDIR)$(BINDIR)/$(TARGET)"
+	@echo "Note:"
+	@echo "multicap needs CAP_NET_RAW. Run it as root, or set capabilities:"
+	@echo "  sudo setcap cap_net_raw,cap_net_admin,cap_sys_nice+ep $(DESTDIR)$(BINDIR)/$(TARGET)"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
@@ -53,9 +53,8 @@ clean:
 tune:
 	@echo "System tuning recommendations for high-bitrate capture:"
 	@echo ""
-	@echo "1. Increase socket buffer sizes:"
-	@echo "   sudo sysctl -w net.core.rmem_max=536870912"
-	@echo "   sudo sysctl -w net.core.rmem_default=67108864"
+	@echo "1. Kernel receive ring per path (default 256 MB):"
+	@echo "   multicap --kring 512 ..."
 	@echo ""
 	@echo "2. Increase network interface ring buffer:"
 	@echo "   sudo ethtool -G eth0 rx 4096"
